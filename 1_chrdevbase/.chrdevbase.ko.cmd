@@ -1,0 +1,1 @@
+cmd_/home/vicky/linux/IMX6ULL/Linux_Drivers/1_chrdevbase/chrdevbase.ko := arm-linux-gnueabihf-ld -EL -r  -T ./scripts/module-common.lds --build-id  -o /home/vicky/linux/IMX6ULL/Linux_Drivers/1_chrdevbase/chrdevbase.ko /home/vicky/linux/IMX6ULL/Linux_Drivers/1_chrdevbase/chrdevbase.o /home/vicky/linux/IMX6ULL/Linux_Drivers/1_chrdevbase/chrdevbase.mod.o
