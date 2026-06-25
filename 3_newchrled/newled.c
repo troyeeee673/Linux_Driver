@@ -6,6 +6,7 @@
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/cdev.h>
+#include <linux/device.h>
 
 /* 寄存器物理地址 */
 #define CCM_CCGR1_BASE (0X020C406C)
@@ -28,22 +29,27 @@ static void __iomem *SW_PAD_GPIO1_IO03;
 static void __iomem *GPIO1_DR;
 static void __iomem *GPIO1_GDIR;
 
+static struct newchrled_dev newchrled;
 /*led 设备结构体*/
 struct newchrled_dev
 {
     struct cdev cdev; // 字符设备结构体
     dev_t devid;      // 整体设备号
-    int major;        // 主设备号
-    int minor;        // 次设备号
+    struct class *class;
+    struct device *device;
+    int major; // 主设备号
+    int minor; // 次设备号
 };
 
 static int newchrled_open(struct inode *inode, struct file *filp)
 {
+    filp->private_data = &newchrled;
     return 0;
 }
 
 static int newchrled_release(struct inode *inode, struct file *filp)
 {
+    struct newchrled_dev *dev = (struct newchrled_dev*)filp->private_data;
     return 0;
 }
 
@@ -81,9 +87,9 @@ static ssize_t newchrled_write(struct file *filp, const char __user *buf,
     return 0;
 }
 
-static struct newchrled_dev newchrled;
+
 static const struct file_operations fops =
-    {
+{
         .owner = THIS_MODULE,
         .write = newchrled_write,
         .open = newchrled_open,
@@ -122,6 +128,7 @@ static int __init newchrled_init(void)
     val &= ~(1 << 3); // 清零bit3, 打开led
     writel(val, GPIO1_DR);
     /*2. 注册设备*/
+    newchrled.major = 0;//手动清零
     if (newchrled.major)
     {
         newchrled.devid = MKDEV(newchrled.major, 0);
@@ -145,12 +152,25 @@ static int __init newchrled_init(void)
     cdev_init(&newchrled.cdev, &fops);
     ret = cdev_add(&newchrled.cdev, newchrled.devid, NEWCHRLED_COUNT);
 
+    /*自动创建字符设备*/
+    newchrled.class = class_create(THIS_MODULE, NEWCHRLED_NAME);
+    if (IS_ERR(newchrled.class))
+    {
+        return PTR_ERR(newchrled.class);
+    }
+    newchrled.device = device_create(newchrled.class, NULL, newchrled.devid, NULL, NEWCHRLED_NAME);
+    if (IS_ERR(newchrled.device))
+    {
+        return PTR_ERR(newchrled.device);
+    }
+
     return 0;
 }
 
 /*出口*/
 static void __exit newchrled_exit(void)
 {
+    
     /*卸载驱动时关闭*/
     unsigned int val = readl(GPIO1_DR);
     val |= (1 << 3); // 置一bit3, 关闭led
@@ -167,6 +187,12 @@ static void __exit newchrled_exit(void)
     cdev_del(&newchrled.cdev);
     /*卸载设备*/
     unregister_chrdev_region(newchrled.devid, NEWCHRLED_COUNT);
+
+
+    /*销毁设备*/
+    device_destroy(newchrled.class, newchrled.devid);
+    /*销毁类*/
+    class_destroy(newchrled.class);
 }
 
 /*注册和卸载模块*/
