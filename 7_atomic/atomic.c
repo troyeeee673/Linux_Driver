@@ -34,7 +34,7 @@ struct gpioled_dev
     int major;
     int minor;
     int led_gpio;
-    atomic_long_t lock;/*原子操作*/
+    atomic_long_t lock;/*原子变量*/
 
 };
 
