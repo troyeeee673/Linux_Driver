@@ -50,11 +50,14 @@ struct imx6uirq_dev
     struct device *device;
     struct device_node *nd;
     struct irq_keydesc irqkey[KEY_NUM];
+    struct timer_list timer;
 
     int major;
     int minor;
     int ledgpio;
-    atomic_long_t timeperiod; // 定时周期
+    atomic_long_t key_value;//按键值
+    atomic_long_t release_key;
+    
 };
 
 struct imx6uirq_dev imx6uirqdev;
@@ -78,7 +81,35 @@ static ssize_t imx6uirq_write(struct file *filp, const char __user *buf,
 
 static ssize_t imx6uirq_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 {
-    return 0;
+    int ret = 0;
+    unsigned long keyvalue;
+    unsigned long releasekey;
+    struct imx6uirq_dev* dev = filp->private_data;
+
+    keyvalue = atomic_long_read(&dev->key_value);
+    releasekey = atomic_long_read(&dev->release_key);
+
+    if(releasekey)/*有效按键*/
+    {
+        if(keyvalue & 0x80)//按键按下并完成释放
+        {
+            keyvalue &= ~0x80;
+            ret = copy_to_user(buf, &keyvalue, sizeof(keyvalue));
+        }
+        else{
+            goto data_error;
+        }
+        atomic_long_set(&dev->release_key, 0);//按下标志清零
+
+    }
+    else{
+        goto data_error;
+    }
+    return ret;
+data_error:
+    return -EINVAL;
+
+    
 }
 
 /*操作集*/
@@ -93,9 +124,9 @@ static const struct file_operations imx6uirq_fops = {
 /*中断处理函数*/
 static irqreturn_t key0_handler(int irq, void *dev_id)
 {
-    int value = 0;
     struct imx6uirq_dev *dev = dev_id;
 
+#if 0
     value = gpio_get_value(dev->irqkey[0].gpio);
     if (value == 0) /* 按下 */
     {
@@ -105,8 +136,32 @@ static irqreturn_t key0_handler(int irq, void *dev_id)
     { /* 释放 */
         printk("KEY0 release!\r\n");
     }
+#endif
+    dev->timer.data = (volatile unsigned long)dev_id;
+    // 进行10ms延时
+    mod_timer(&dev->timer, jiffies + msecs_to_jiffies(10));
 
     return IRQ_HANDLED;
+}
+
+/* 定时器处理函数 */
+static void timer_func(unsigned long arg)
+{
+    int value = 0;
+    struct imx6uirq_dev *dev = (struct imx6uirq_dev *)arg;
+
+    value = gpio_get_value(dev->irqkey[0].gpio);
+    if (value == 0) /* 按下 */
+    {
+        atomic_long_set(&dev->key_value, dev->irqkey[0].value);
+        printk("KEY0 Push!\r\n");
+    }
+    else if (value == 1)/* 释放 */
+    { 
+        atomic_long_set(&dev->key_value, dev->irqkey[0].value | 0x80);//最高位置一，代表释放
+        atomic_long_set(&dev->release_key, 1);
+        printk("KEY0 release!\r\n");
+    }
 }
 
 /*按键初始化*/
@@ -239,6 +294,14 @@ static int __init imx6uirq_init(void)
     if (ret < 0)
         goto fail_keyio;
 
+    // 初始化定时器
+    init_timer(&imx6uirqdev.timer);
+    imx6uirqdev.timer.function = timer_func;
+
+    /*按键值初始化*/
+    atomic_long_set(&imx6uirqdev.key_value, INVAKEY);
+    atomic_long_set(&imx6uirqdev.release_key, 0);
+
     return 0;
 
 fail_keyio:
@@ -266,6 +329,8 @@ static void __exit imx6uirq_exit(void)
         gpio_free(imx6uirqdev.irqkey[i].gpio); // 修正：传递gpio编号
     }
 
+    /*删除定时器*/
+    del_timer_sync(&imx6uirqdev.timer);
     /* 注销字符设备驱动 */
     cdev_del(&imx6uirqdev.cdev);
     unregister_chrdev_region(imx6uirqdev.devid, IMX6UIRQ_CNT);
