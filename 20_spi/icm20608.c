@@ -48,7 +48,7 @@ struct icm20608_dev
     struct device *device;
     void *pribate_data;
     struct device_node *nd;
-    int cs_gpio;            // 片选信号
+    // int cs_gpio;            // 片选信号
     signed int gyro_x_adc;  /* 陀螺仪X轴原始值 */
     signed int gyro_y_adc;  /* 陀螺仪Y轴原始值 */
     signed int gyro_z_adc;  /* 陀螺仪Z轴原始值 */
@@ -146,35 +146,43 @@ static int icm20608_read_regs(struct icm20608_dev *dev, u8 reg, void *buf, int l
     u8 data = 0;
     struct spi_device *spi = (struct spi_device *)dev->pribate_data;
     /*片选拉低*/
-    gpio_set_value(dev->cs_gpio, 0);
+    // gpio_set_value(dev->cs_gpio, 0);
     /*1. 发送要读取的寄存器地址*/
     data = reg | 0x80;        // 寄存器地址
-    spi_write(spi, &data, 1); // 内核提供的写函数
+
+    spi_write_then_read(spi, &data, 1, buf, len);
+    // spi_write(spi, &data, 1); // 内核提供的写函数
 
     /*2. 读取数据*/
-    spi_read(spi, buf, len);
+    // spi_read(spi, buf, len);
 
     /*片选拉高*/
-    gpio_set_value(dev->cs_gpio, 1);
+    // gpio_set_value(dev->cs_gpio, 1);
     return 0;
 }
 
 /*写入icm20608的N个寄存器*/
 static int icm20608_write_regs(struct icm20608_dev *dev, u8 reg, u8 *buf, u8 len)
 {
-    u8 data = 0;
+    // u8 data = 0;
+    u8 *txdata;
     struct spi_device *spi = (struct spi_device *)dev->pribate_data;
     /*片选拉低*/
-    gpio_set_value(dev->cs_gpio, 0);
+    // gpio_set_value(dev->cs_gpio, 0);
     /*1. 发送要读取的寄存器地址*/
-    data = reg & ~0x80;       // 寄存器地址
-    spi_write(spi, &data, 1); // 内核提供的写函数
+    // data = reg & ~0x80;       // 寄存器地址
+    txdata = kzalloc(len + 1, GFP_KERNEL);
+    txdata[0] = reg & ~0x80;
+    memcpy(&txdata[1], buf, len);
+    spi_write(spi, txdata, len + 1);
+
+    // spi_write(spi, &data, 1); // 内核提供的写函数
 
     /*2. 发送写入数据*/
-    spi_write(spi, buf, len);
+    // spi_write(spi, buf, len);
 
     /*片选拉高*/
-    gpio_set_value(dev->cs_gpio, 1);
+    // gpio_set_value(dev->cs_gpio, 1);
     return 0;
 }
 
@@ -323,6 +331,7 @@ static int icm20608_probe(struct spi_device *spi)
         goto fail_device;
     }
 
+#if 0
     /*获取片选引脚*/
     icm20608_dev.nd = of_get_parent(spi->dev.of_node);
 
@@ -348,6 +357,7 @@ static int icm20608_probe(struct spi_device *spi)
         ret = -EINVAL;
         goto fail_output;
     }
+#endif
 
     /*初始化spi_device*/
     spi->mode = SPI_MODE_0;
@@ -359,7 +369,7 @@ static int icm20608_probe(struct spi_device *spi)
 
     return 0;
 fail_output:
-    gpio_free(icm20608_dev.cs_gpio);
+    // gpio_free(icm20608_dev.cs_gpio);
 fail_request:
 fail_gpio:
 fail_device:
@@ -378,7 +388,7 @@ static int icm20608_remove(struct spi_device *spi)
     unregister_chrdev_region(icm20608_dev.devid, ICM20608_DEV_CNT);
     device_destroy(icm20608_dev.class, icm20608_dev.devid);
     class_destroy(icm20608_dev.class);
-    gpio_free(icm20608_dev.cs_gpio);
+    // gpio_free(icm20608_dev.cs_gpio);
     return 0;
 }
 // spi_driver
