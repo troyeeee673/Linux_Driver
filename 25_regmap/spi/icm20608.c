@@ -21,10 +21,76 @@
 #include <linux/spi/spi.h>
 #include <linux/delay.h>
 #include <linux/regmap.h>
+#include <linux/iio/iio.h>
+#include <linux/iio/sysfs.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/trigger.h>
+#include <linux/iio/triggered_buffer.h>
+#include <linux/iio/trigger_consumer.h>
+#include <linux/unaligned/be_byteshift.h>
 #include "icm20608.h"
 
 #define ICM20608_DEV_CNT 1
 #define ICM20608_DEV_NAME "icm20608"
+
+/*
+ * ICM20608的扫描元素，3轴加速度计、
+ * 3轴陀螺仪、1路温度传感器，1路时间戳
+ */
+enum inv_icm20608_scan
+{
+    INV_ICM20608_SCAN_ACCL_X,
+    INV_ICM20608_SCAN_ACCL_Y,
+    INV_ICM20608_SCAN_ACCL_Z,
+    INV_ICM20608_SCAN_TEMP,
+    INV_ICM20608_SCAN_GYRO_X,
+    INV_ICM20608_SCAN_GYRO_Y,
+    INV_ICM20608_SCAN_GYRO_Z,
+    INV_ICM20608_SCAN_TIMESTAMP,
+};
+
+#define ICM20608_CHAN(_type, _channel2, _index) {         \
+    .type = _type,                                        \
+    .modified = 1,                                        \
+    .channel2 = _channel2,                                \
+    .info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE), \
+    .info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |        \
+                          BIT(IIO_CHAN_INFO_CALIBBIAS),   \
+    .scan_index = _index,                                 \
+    .scan_type = {                                        \
+        .sign = 's',                                      \
+        .realbits = 16,                                   \
+        .storagebits = 16,                                \
+        .shift = 0,                                       \
+        .endianness = IIO_BE,                             \
+    },                                                    \
+}
+
+/* ICM20608 通道 */
+static const struct iio_chan_spec icm20608_channels[] = {
+    /* 温度通道 */
+    {
+        .type = IIO_TEMP,
+        .info_mask_separate = BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_OFFSET) | BIT(IIO_CHAN_INFO_SCALE),
+        .scan_index = INV_ICM20608_SCAN_TEMP,
+        .scan_type = {
+            .sign = 's',
+            .realbits = 16,
+            .storagebits = 16,
+            .shift = 0,
+            .endianness = IIO_BE,
+        },
+    },
+
+    /* 加速度X，Y，Z三个通道 */
+    ICM20608_CHAN(IIO_ACCEL, IIO_MOD_X, INV_ICM20608_SCAN_ACCL_X), /* 加速度X轴 */
+    ICM20608_CHAN(IIO_ACCEL, IIO_MOD_Y, INV_ICM20608_SCAN_ACCL_Y), /* 加速度Y轴 */
+    ICM20608_CHAN(IIO_ACCEL, IIO_MOD_Z, INV_ICM20608_SCAN_ACCL_Z), /* 加速度Z轴 */
+
+    ICM20608_CHAN(IIO_ANGL_VEL, IIO_MOD_X, INV_ICM20608_SCAN_GYRO_X), /* 陀螺仪X轴 */
+    ICM20608_CHAN(IIO_ANGL_VEL, IIO_MOD_Y, INV_ICM20608_SCAN_GYRO_Y), /* 陀螺仪Y轴 */
+    ICM20608_CHAN(IIO_ANGL_VEL, IIO_MOD_Z, INV_ICM20608_SCAN_GYRO_Z), /* 陀螺仪Z轴 */
+};
 
 /*传统的匹配表*/
 static struct spi_device_id icm20608_id[] = {
@@ -41,29 +107,11 @@ static struct of_device_id icm20608_of_match[] = {
 // 设备结构体
 struct icm20608_dev
 {
-    int major;
-    int minor;
-    dev_t devid;
-    struct cdev cdev;
-    struct class *class;
-    struct device *device;
-    void *pribate_data;
-    struct device_node *nd;
-    // int cs_gpio;            // 片选信号
-    signed int gyro_x_adc;  /* 陀螺仪X轴原始值 */
-    signed int gyro_y_adc;  /* 陀螺仪Y轴原始值 */
-    signed int gyro_z_adc;  /* 陀螺仪Z轴原始值 */
-    signed int accel_x_adc; /* 加速度计X轴原始值 */
-    signed int accel_y_adc; /* 加速度计Y轴原始值 */
-    signed int accel_z_adc; /* 加速度计Z轴原始值 */
-    signed int temp_adc;    /* 温度原始值 */
-
+    struct spi_device *spi;
     struct regmap *regmap;
     struct regmap_config regmap_config;
+    struct mutex mutex;
 };
-struct icm20608_dev icm20608_dev;
-
-
 
 /*读取一个寄存器*/
 static unsigned char icm20608_read_one_reg(struct icm20608_dev *dev, u8 reg)
@@ -79,58 +127,11 @@ static void icm20608_write_one_reg(struct icm20608_dev *dev, u8 reg, u8 data)
 {
     u8 buf = 0;
     buf = data;
-    regmap_write(dev->regmap,reg, data);
+    regmap_write(dev->regmap, reg, data);
 }
 
-void icm20608_readdata(struct icm20608_dev *dev)
-{
-    unsigned char data[14];
-
-    regmap_bulk_read(dev->regmap, ICM20_ACCEL_XOUT_H, data, 14);
-
-    dev->accel_x_adc = (signed short)((data[0] << 8) | data[1]);
-    dev->accel_y_adc = (signed short)((data[2] << 8) | data[3]);
-    dev->accel_z_adc = (signed short)((data[4] << 8) | data[5]);
-    dev->temp_adc = (signed short)((data[6] << 8) | data[7]);
-    dev->gyro_x_adc = (signed short)((data[8] << 8) | data[9]);
-    dev->gyro_y_adc = (signed short)((data[10] << 8) | data[11]);
-    dev->gyro_z_adc = (signed short)((data[12] << 8) | data[13]);
-}
-
-static int icm20608_open(struct inode *inode, struct file *filp)
-{
-    filp->private_data = &icm20608_dev;
-    return 0;
-}
-
-static int icm20608_release(struct inode *inode, struct file *filp)
-{
-    return 0;
-}
-
-ssize_t icm20608_read(struct file *filp, char __user *buf, size_t cnt, loff_t *offf)
-{
-    signed int data[7];
-    long err = 0;
-    struct icm20608_dev *dev = (struct icm20608_dev *)filp->private_data;
-
-    icm20608_readdata(dev);
-    data[0] = dev->gyro_x_adc;
-    data[1] = dev->gyro_y_adc;
-    data[2] = dev->gyro_z_adc;
-    data[3] = dev->accel_x_adc;
-    data[4] = dev->accel_y_adc;
-    data[5] = dev->accel_z_adc;
-    data[6] = dev->temp_adc;
-    err = copy_to_user(buf, data, sizeof(data));
-    return err;
-}
-/*操作集*/
-static const struct file_operations icm20608_fops = {
-    .owner = THIS_MODULE,
-    .read = icm20608_read,
-    .open = icm20608_open,
-    .release = icm20608_release,
+static const struct iio_info icm20608_info = {
+    .driver_module = THIS_MODULE,
 };
 
 /*icm20608芯片初始化*/
@@ -160,92 +161,169 @@ void icm20608_chip_init(struct icm20608_dev *dev)
     icm20608_write_one_reg(dev, ICM20_FIFO_EN, 0x00);       /* 关闭FIFO */
 }
 
+static int icm20608_read_channel_data(struct iio_dev *indio_dev,
+                                      struct iio_chan_spec const *chan, int *val)
+{
+    int ret = 0;
+    struct icm20608_dev *dev = iio_priv(indio_dev);
+
+    switch (chan->type)
+    {
+    case IIO_ACCEL:
+        printk("IIO_ACCEL\r\n");
+        switch (chan->channel2)
+        {
+        case IIO_MOD_X:
+            printk("IIO_MOD_X\r\n");
+            break;
+        case IIO_MOD_Y:
+            printk("IIO_MOD_Y\r\n");
+            break;
+        case IIO_MOD_Z:
+            printk("IIO_MOD_Z\r\n");
+            break;
+        default:
+            break;
+        }
+        break;
+    case IIO_ANGL_VEL:
+        printk("IIO_ANGL_VEL\r\n");
+        break;
+    case IIO_TEMP:
+        printk("IIO_TEMP\r\n");
+        break;
+    default:
+        ret = -EINVAL;
+    }
+
+    return ret;
+}
+
+static int icm20608_read_raw(struct iio_dev *indio_dev,
+                             struct iio_chan_spec const *chan, int *val, int *val2,
+                             long mask)
+{
+    int ret = 0;
+    struct icm20608_dev *dev = iio_priv(indio_dev);
+
+    /* 区分读取的数据类型，是RAW? SCALE? 还是OFFSET等 */
+    switch (mask)
+    {
+    case IIO_CHAN_INFO_RAW:
+        printk("IIO_CHAN_INFO_RAW\r\n");
+        mutex_lock(&dev->mutex);
+        icm20608_read_channel_data(indio_dev, chan, val);
+        mutex_unlock(&dev->mutex);
+        return ret;
+    case IIO_CHAN_INFO_SCALE:
+        printk("IIO_CHAN_INFO_SCALE\r\n");
+        return ret;
+    case IIO_CHAN_INFO_OFFSET:
+        printk("IIO_CHAN_INFO_OFFSET\r\n");
+        return ret;
+    case IIO_CHAN_INFO_CALIBBIAS:
+        printk("IIO_CHAN_INFO_CALIBBIAS\r\n");
+        return ret;
+    default:
+        return -EINVAL;
+    }
+
+    return 0;
+}
+static int icm20608_write_raw(struct iio_dev *indio_dev,
+                              struct iio_chan_spec const *chan, int val, int val2, long mask)
+{
+    printk("icm20608_write_raw\r\n");
+    return 0;
+}
+
+static int icm20608_write_raw_get_fmt(struct iio_dev *indio_dev,
+                                      struct iio_chan_spec const *chan,
+                                      long mask)
+{
+    printk("icm20608_write_raw_get_fmt\r\n");
+    return 0;
+}
+
+/* iio_info */
+static const struct iio_info icm20608_info = {
+    .driver_module = THIS_MODULE,
+    .read_raw = icm20608_read_raw,
+    .write_raw = icm20608_write_raw,
+    .write_raw_get_fmt = icm20608_write_raw_get_fmt,
+};
+
 static int icm20608_probe(struct spi_device *spi)
 {
     int ret = 0;
-    /*搭建字符设备框架，进行数据的读取*/
-    /*注册字符设备*/
-    icm20608_dev.major = 0;
-    if (icm20608_dev.major)
-    {
-        /*1. 创建设备号*/
-        icm20608_dev.devid = MKDEV(icm20608_dev.major, 0);
-        /*2. 注册设备*/
-        ret = register_chrdev_region(icm20608_dev.devid, ICM20608_DEV_CNT, ICM20608_DEV_NAME);
-    }
-    else
-    {
-        ret = alloc_chrdev_region(&icm20608_dev.devid, 0, ICM20608_DEV_CNT, ICM20608_DEV_NAME);
-        icm20608_dev.major = MAJOR(icm20608_dev.devid);
-        icm20608_dev.minor = MINOR(icm20608_dev.devid);
-    }
-    if (ret < 0)
-    {
-        ret = -EFAULT;
-        goto fail_devid;
-    }
-    /*初始化cdev*/
-    icm20608_dev.cdev.owner = THIS_MODULE;
-    cdev_init(&icm20608_dev.cdev, &icm20608_fops);
+    /*申请iio_dev和icm20608_dev*/
+    struct icm20608_dev *dev;
+    struct iio_dev *indio_dev;
 
-    /*添加cdev*/
-    ret = cdev_add(&icm20608_dev.cdev, icm20608_dev.devid, ICM20608_DEV_CNT);
-    if (ret < 0)
+    indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*dev));
+    if (indio_dev)
     {
         ret = -EINVAL;
-        goto fail_cdev;
+        goto fail_iio_alloc;
     }
 
-    /*创建类*/
-    icm20608_dev.class = class_create(THIS_MODULE, ICM20608_DEV_NAME);
-    if (IS_ERR(icm20608_dev.class))
+    dev = iio_priv(indio_dev);
+
+    /*初始化dev*/
+    dev->spi = spi;
+    spi_set_drvdata(spi, indio_dev);
+    mutex_init(&dev->mutex);
+
+    // 初始化iio_dev
+    indio_dev->dev.parent = &spi->dev;
+    indio_dev->channels = icm20608_channels;
+    indio_dev->num_channels = ARRAY_SIZE(icm20608_channels);
+    indio_dev->name = ICM20608_DEV_NAME;
+    indio_dev->modes = INDIO_DIRECT_MODE; /* 直接模式，提供sysfs接口 */
+    indio_dev->info = &icm20608_info;
+
+    /* 将iio_dev注册到内核 */
+    ret = iio_device_register(indio_dev);
+    if (ret < 0)
     {
-        ret = PTR_ERR(icm20608_dev.class);
-        goto fail_class;
+        dev_err(&spi->dev, "unable to register iio device\n");
+        goto fail_iio_register;
     }
 
-    /*创建设备*/
-    icm20608_dev.device = device_create(icm20608_dev.class, NULL, icm20608_dev.devid, NULL, ICM20608_DEV_NAME);
-    if (IS_ERR(icm20608_dev.device))
-    {
-        ret = PTR_ERR(icm20608_dev.device);
-        goto fail_device;
-    }
-
-    
     /*申请并初始化regmap*/
-    icm20608_dev.regmap_config.reg_bits = 8;
-    icm20608_dev.regmap_config.val_bits = 8;
-    icm20608_dev.regmap_config.read_flag_mask = 0x80;
+    dev->regmap_config.reg_bits = 8;
+    dev->regmap_config.val_bits = 8;
+    dev->regmap_config.read_flag_mask = 0x80;
 
-    icm20608_dev.regmap = regmap_init_spi(spi, &icm20608_dev.regmap_config);
+    dev->regmap = regmap_init_spi(spi, &(dev->regmap_config));
     /*初始化spi_device*/
     spi->mode = SPI_MODE_0;
     spi_setup(spi);
-    /*设置私有数据*/
-    icm20608_dev.pribate_data = spi;
-    /*初始化icm20608*/
-    icm20608_chip_init(&icm20608_dev);
+
+    // 初始化icm20608
+    icm20608_chip_init(dev);
 
     return 0;
-fail_device:
-    class_destroy(icm20608_dev.class);
-fail_class:
-    cdev_del(&icm20608_dev.cdev);
-fail_cdev:
-    unregister_chrdev_region(icm20608_dev.devid, ICM20608_DEV_CNT);
-fail_devid:
+fail_iio_register:
+fail_iio_alloc:
     return ret;
 }
 
 static int icm20608_remove(struct spi_device *spi)
 {
-    cdev_del(&icm20608_dev.cdev);
-    unregister_chrdev_region(icm20608_dev.devid, ICM20608_DEV_CNT);
-    device_destroy(icm20608_dev.class, icm20608_dev.devid);
-    class_destroy(icm20608_dev.class);
-    regmap_exit(icm20608_dev.regmap);
-    return 0;
+    int ret = 0;
+
+    struct iio_dev *indio_dev = spi_get_drvdata(spi);
+    struct icm20608_dev *dev;
+
+    dev = iio_priv(indio_dev);
+
+    /* 1、注销iio_dev */
+    iio_device_unregister(indio_dev);
+
+    /* 2、删除regmap */
+    regmap_exit(dev->regmap);
+    return ret;
 }
 // spi_driver
 static struct spi_driver icm20608_driver = {
